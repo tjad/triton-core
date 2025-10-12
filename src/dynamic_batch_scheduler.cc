@@ -338,10 +338,12 @@ DynamicBatchScheduler::BatcherThread(const int nice)
     // Hold the lock for as short a time as possible.
     {
       std::unique_lock<std::mutex> lock(mu_);
+      bool was_saturated = false;
       {
         std::lock_guard<std::mutex> exec_lock(*(curr_payload_->GetExecMutex()));
         auto payload_state = curr_payload_->GetState();
         if (payload_saturated_ || IsStaleState(payload_state)) {
+          was_saturated = payload_saturated_;
           NewPayload();
           next_preferred_batch_size_ = 0;
         }
@@ -359,11 +361,12 @@ DynamicBatchScheduler::BatcherThread(const int nice)
                        << " queued requests, current total = " << queue_.Size();
       } else if (queue_.Empty()) {
         wait_microseconds = default_wait_microseconds;
+      } else if (was_saturated) {
+        // Payload was saturated and has been reset. Wait before re-processing
+        // to avoid busy-wait loop where GetDynamicBatch() immediately saturates
+        // the new payload again with no progress made.
+        wait_microseconds = default_wait_microseconds;
       } else {
-        if (payload_saturated_) {
-          continue;
-        }
-
         WaitForPayloadSlotAvailable(&lock, default_wait_microseconds);
 
         {
