@@ -274,6 +274,36 @@ class SequenceBatchScheduler : public Scheduler {
   size_t backlog_delay_cnt_;
   std::unordered_map<const TritonModelInstance*, size_t> queue_request_cnts_;
 
+#ifdef TRITON_ENABLE_SEQUENCE_BATCH_TESTING
+ public:
+  // Test accessors for internal state verification
+  size_t TestGetCorrelationIdTimestampCount() const
+  {
+    std::lock_guard<std::mutex> lock(
+        const_cast<std::mutex&>(mu_));  // Safe for read-only
+    return correlation_id_timestamps_.size();
+  }
+  bool TestHasCorrelationIdTimestamp(
+      const InferenceRequest::SequenceId& corr_id) const
+  {
+    std::lock_guard<std::mutex> lock(const_cast<std::mutex&>(mu_));
+    return correlation_id_timestamps_.find(corr_id) !=
+           correlation_id_timestamps_.end();
+  }
+  size_t TestGetBacklogMapCount() const
+  {
+    std::lock_guard<std::mutex> lock(const_cast<std::mutex&>(mu_));
+    return sequence_to_backlog_map_.size();
+  }
+  size_t TestGetBacklogQueuesCount() const
+  {
+    std::lock_guard<std::mutex> lock(const_cast<std::mutex&>(mu_));
+    return backlog_queues_.size();
+  }
+
+ private:
+#endif  // TRITON_ENABLE_SEQUENCE_BATCH_TESTING
+
   // IO mapping between the output state name and the state configuration.
   std::unordered_map<std::string, const inference::ModelSequenceBatching_State&>
       state_output_config_map_;

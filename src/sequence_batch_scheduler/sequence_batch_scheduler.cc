@@ -855,6 +855,7 @@ SequenceBatchScheduler::Enqueue(std::unique_ptr<InferenceRequest>& irequest)
   // correlation.
   if (seq_end) {
     sequence_to_batcherseqslot_map_.erase(correlation_id);
+    correlation_id_timestamps_.erase(correlation_id);
   }
 
   // Enqueue request into batcher and sequence slot.  Don't hold the
@@ -964,6 +965,8 @@ SequenceBatchScheduler::ReleaseSequenceSlot(
     if (seq_cancelled) {
       LOG_VERBOSE(1) << irequest->LogRequest() << "CORRID " << correlation_id
                      << " sequence cancelled: " << irequest->ModelName();
+      // Clean up timestamp to ensure a reused correlation ID starts fresh.
+      correlation_id_timestamps_.erase(correlation_id);
       MarkRequestsCancelled(backlog.get());
       continue;
     }
@@ -1065,6 +1068,7 @@ SequenceBatchScheduler::ReaperThread(const int nice)
     if (now_us >= idle_timestamp) {
       uint64_t wait_microseconds = max_sequence_idle_microseconds_;
       BatcherSequenceSlotMap force_end_sequences;
+      std::deque<std::shared_ptr<BacklogQueue>> idle_backlogs;
       {
         std::unique_lock<std::mutex> lock(mu_);
         for (auto cid_itr = correlation_id_timestamps_.cbegin();
@@ -1106,16 +1110,24 @@ SequenceBatchScheduler::ReaperThread(const int nice)
                   << "Reaper: removing idle backlog sequence CORRID "
                   << idle_correlation_id;
 
+              // Collect the backlog for responding outside the lock
+              std::shared_ptr<BacklogQueue> idle_backlog = idle_bl_itr->second;
+              idle_backlogs.emplace_back(idle_backlog);
+
+              // Remove from backlog_queues_ (find by shared_ptr identity)
+              for (auto it = backlog_queues_.begin();
+                   it != backlog_queues_.end(); ++it) {
+                if (*it == idle_backlog) {
+                  backlog_queues_.erase(it);
+                  break;
+                }
+              }
+
               // Remove from backlog map
               sequence_to_backlog_map_.erase(idle_bl_itr);
 
               // Remove timestamp entry
               cid_itr = correlation_id_timestamps_.erase(cid_itr);
-
-              // Note: The backlog queue will be handled when it's
-              // dequeued from backlog_queues_ and found to not be
-              // in sequence_to_backlog_map_ anymore, or by the timeout
-              // mechanism if it has a timeout set.
             } else {
               LOG_VERBOSE(1) << "Reaper: ignoring stale idle CORRID "
                              << idle_correlation_id;
@@ -1142,6 +1154,18 @@ SequenceBatchScheduler::ReaperThread(const int nice)
         std::unique_ptr<InferenceRequest> null_request;
         batchers_[model_instance]->Enqueue(
             seq_slot, idle_correlation_id, null_request);
+      }
+
+      // Respond with error to idle backlog requests outside of the lock.
+      const static Status idle_status = Status(
+          Status::Code::UNAVAILABLE,
+          "sequence idle time exceeded, sequence was cancelled");
+      for (auto& backlog : idle_backlogs) {
+        for (auto& req : *backlog->queue_) {
+          InferenceRequest::RespondIfError(
+              req, idle_status, true /* release_requests */,
+              FailureReason::REJECTED);
+        }
       }
 
       // Update timestamp for next idle check
@@ -1175,6 +1199,9 @@ SequenceBatchScheduler::ReaperThread(const int nice)
             if ((mit != sequence_to_backlog_map_.end()) &&
                 (mit->second->expiration_timestamp_ <= now_us)) {
               sequence_to_backlog_map_.erase(mit);
+              // Also remove timestamp to prevent stale entries from causing
+              // the reaper to loop on this correlation ID.
+              correlation_id_timestamps_.erase(correlation_id);
             }
 
             it = backlog_queues_.erase(it);
